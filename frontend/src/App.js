@@ -31,7 +31,7 @@ const fetchJSON = async (url, options = {}, ms = 10000) => {
     if (res.ok && ct.includes("application/json")) return JSON.parse(text);
     if (ct.includes("application/json")) {
       let payload; try { payload = JSON.parse(text); } catch {}
-      const msg = payload?.detail || payload?.message || text.slice(0,160);
+      const msg = payload?.detail || payload?.message || text.slice(0, 160);
       throw new Error(`HTTP ${res.status}: ${msg}`);
     }
 
@@ -55,13 +55,13 @@ const fetchJSON = async (url, options = {}, ms = 10000) => {
       if (r2.ok && ct2.includes("application/json")) return JSON.parse(tx2);
       if (ct2.includes("application/json")) {
         let payload; try { payload = JSON.parse(tx2); } catch {}
-        const msg = payload?.detail || payload?.message || tx2.slice(0,160);
+        const msg = payload?.detail || payload?.message || tx2.slice(0, 160);
         throw new Error(`HTTP ${r2.status}: ${msg}`);
       }
       throw new Error(`JSON 아님: ${ct2 || "unknown"}`);
     }
 
-    throw new Error(`HTTP ${res.status} ${text.slice(0,160)}…`);
+    throw new Error(`HTTP ${res.status} ${text.slice(0, 160)}…`);
   } finally {
     clearTimeout(t);
   }
@@ -73,7 +73,6 @@ function ResultsView({ data, upgrading, onBack }) {
   return (
     <div style={{ maxWidth: 980, margin: "24px auto" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-        {/* A안 적용: CSS로 숨길 수 있게 클래스 부여 */}
         <button
           className="results-back-btn"
           onClick={onBack}
@@ -132,6 +131,7 @@ export default function App() {
   const heroInputRef = useRef(null);
 
   useEffect(() => {
+    console.log("API_URL =", API_URL);
     const saved = localStorage.getItem("chat-log");
     if (saved) setMessages(JSON.parse(saved));
   }, []);
@@ -142,7 +142,7 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const data = await fetchJSON(`${API_URL}/popular_keywords/`, {}, 8000);
+        const data = await fetchJSON(`${API_URL}/popular_keywords`, {}, 8000);
         setPopular(Array.isArray(data) ? data.slice(0, 8) : []);
       } catch {}
     })();
@@ -151,7 +151,7 @@ export default function App() {
   const playAudio = async (text) => {
     if (!text?.trim()) return;
     try {
-      const res = await fetch(`${API_URL}/generate-tts/`, {
+      const res = await fetch(`${API_URL}/generate-tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
@@ -169,7 +169,6 @@ export default function App() {
     setLoading(true);
     setUpgrading(true);
 
-    // (즉시 3번 레이아웃) 플레이스홀더 push
     const placeholder = {
       initial_keyword: query,
       refined_keyword: "",
@@ -179,9 +178,8 @@ export default function App() {
     };
     setMessages((prev) => [...prev, { query, results: placeholder, _upgrading: true }]);
 
-    // 정식 요약(필수)
     const normalReq = fetchJSON(
-      `${API_URL}/news_trend/`,
+      `${API_URL}/news_trend`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -190,7 +188,6 @@ export default function App() {
       35000
     );
 
-    // 빠른 프리뷰(옵션)
     if (fastPreview) {
       fetchJSON(`${API_URL}/headline_quick?kw=${encodeURIComponent(query)}`, {}, 12000)
         .then((quick) => {
@@ -229,32 +226,110 @@ export default function App() {
   const submitHeroSearch = (e) => {
     e.preventDefault();
     const v = heroInputRef.current?.value || "";
-    // 필요하면 여기만 fastPreview: true 로 바꾸기
     handleSearch(v, { fastPreview: false });
   };
 
+  // ---------- STT (안전 생성 + 자동 stop + 용량 가드 + 에러 표시) ----------
   const startRecording = async () => {
-    setRecording(true);
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const recorder = new MediaRecorder(stream);
-    recorderRef.current = recorder;
-    chunksRef.current = [];
-    recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
-    recorder.onstop = async () => {
-      setRecording(false);
-      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-      const form = new FormData();
-      form.append("file", blob, "rec.webm");
+    try {
+      setRecording(true);
+
+      // 브라우저/권한 체크
+      if (typeof window === "undefined" || !("MediaRecorder" in window)) {
+        setRecording(false);
+        alert("이 브라우저에서는 음성 녹음을 지원하지 않습니다.");
+        return;
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // 코덱 호환 선택 (opus 우선)
+      const picks = [
+        "audio/webm;codecs=opus",
+        "audio/ogg;codecs=opus",
+        "audio/webm",
+        "audio/ogg",
+      ];
+      const mime = (MediaRecorder.isTypeSupported
+        ? picks.find((t) => MediaRecorder.isTypeSupported(t))
+        : "") || "";
+
+      // 안전 생성 (실패 시 기본 생성 폴백)
+      let rec;
       try {
-        const res = await fetch(`${API_URL}/generate-stt/`, { method: "POST", body: form });
-        const { text } = await res.json();
-        if (heroInputRef.current) heroInputRef.current.value = text || "";
-        handleSearch(text, { fastPreview: false });
-      } catch {}
-    };
-    recorder.start();
+        rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      } catch (e) {
+        console.warn("[STT] mime 실패, 기본 생성:", e);
+        rec = new MediaRecorder(stream);
+      }
+
+      recorderRef.current = rec;
+      chunksRef.current = [];
+
+      rec.onstart = () => console.log("[STT] start, mime =", mime || "(default)");
+      rec.onerror = (e) => console.error("[STT] recorder error:", e);
+      rec.ondataavailable = (e) => {
+        if (e.data && e.data.size) chunksRef.current.push(e.data);
+      };
+
+      rec.onstop = async () => {
+        try {
+          setRecording(false);
+          const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+          chunksRef.current = [];
+          console.log("[STT] blob size:", blob.size);
+
+          // 최소 크기 가드 (빈/너무 짧은 녹음 방지)
+          if (blob.size < 2048) {
+            alert("녹음 데이터가 너무 작아요. 3~5초 또박또박 말해보세요.");
+            return;
+          }
+
+          const form = new FormData();
+          form.append("file", blob, "rec.webm");
+
+          const res = await fetch(`${API_URL}/generate-stt`, { method: "POST", body: form });
+          const data = await res.json().catch(() => ({}));
+          console.log("[STT] resp:", data, "ok?", res.ok);
+
+          if (!res.ok) {
+            alert("STT 서버 오류: " + (data?.error || `HTTP ${res.status}`));
+            return;
+          }
+
+          const text = (data?.text || "").trim();
+          if (heroInputRef.current) heroInputRef.current.value = text;
+          if (!text) {
+            alert("음성 인식 결과가 비어 있어요. 3~5초 또박또박 말해보세요.");
+            return;
+          }
+          handleSearch(text, { fastPreview: false });
+        } catch (err) {
+          console.error("[STT] 업로드/파싱 실패:", err);
+          alert("STT 처리 실패: " + (err?.message || err));
+        } finally {
+          try {
+            stream.getTracks().forEach((t) => t.stop());
+          } catch {}
+        }
+      };
+
+      rec.start();
+      // 자동 정지: 4초 후 onstop → STT 업로드
+      setTimeout(() => {
+        if (rec.state === "recording") rec.stop();
+      }, 4000);
+    } catch (err) {
+      console.error("[STT] startRecording 실패:", err);
+      setRecording(false);
+      alert("마이크 권한/장치 또는 브라우저 호환성 문제로 녹음을 시작하지 못했습니다.");
+    }
   };
-  const stopRecording = () => recorderRef.current?.stop();
+
+  const stopRecording = () => {
+    const r = recorderRef.current;
+    if (r && r.state === "recording") r.stop();
+  };
+  // ---------- STT 끝 ----------
 
   const onHeroMicClick = () => (recording ? stopRecording() : startRecording());
   const onHeroSearchClick = () => heroInputRef.current?.focus();
@@ -289,15 +364,22 @@ export default function App() {
             <div className="news-hero__desk">
               <img src={loading ? hamster2 : hamster} alt="hamster anchor" className="news-hero__hamster" />
               <div className="news-hero__props">
-                <button className="prop" title={recording ? "녹음 중지" : "음성으로 검색"} onClick={onHeroMicClick}>🎙️</button>
-                <button className="prop" title="검색 입력창 포커스" onClick={onHeroSearchClick}>🔍</button>
-                {/* 제목 변경: 메인으로 */}
-                <button className="prop" title="메인으로" onClick={onHeroPaperClick}>📰</button>
+                <button className="prop" title={recording ? "녹음 중지" : "음성으로 검색"} onClick={onHeroMicClick}>
+                  🎙️
+                </button>
+                <button className="prop" title="검색 입력창 포커스" onClick={onHeroSearchClick}>
+                  🔍
+                </button>
+                <button className="prop" title="메인으로" onClick={onHeroPaperClick}>
+                  📰
+                </button>
               </div>
 
               <form className="news-hero__search" onSubmit={submitHeroSearch} title={headerTitle}>
                 <input ref={heroInputRef} type="text" className="hero-search-input" placeholder="무엇이든 물어보세요" />
-                <button className="hero-search-btn" type="submit">검색</button>
+                <button className="hero-search-btn" type="submit">
+                  검색
+                </button>
                 {upgrading && <span style={{ marginLeft: 12, fontSize: 12, color: "#888" }}>요약 업그레이드 중…</span>}
               </form>
             </div>

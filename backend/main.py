@@ -292,7 +292,7 @@ dual_query_chain = (
         "- q1은 주제를 넓게 포착해 상위 기사들을 수집하기 좋게 만든다.\n"
         "- q2는 시기(최근/올해/지난달 등), 대상(국가/기업/인물), 행위(협상/합의/인하/제재/발표 등), 품목(철강/자동차/반도체 등)을 명시한다.\n"
         "출력은 JSON만 허용한다. 다른 설명 금지.\n"
-        '{{\"q1\":\"...\",\"q2\":\"...\"}}\n\n'
+        '{{"q1":"...","q2":"..."}}\n\n'
         "## 사용자 질의\n{user_query}\n\n"
         "## 상위 키워드(빈도순)\n{top_keywords}\n"
     ) | llm | output_parser
@@ -579,22 +579,54 @@ async def generate_tts(req: TTSRequest):
         raise HTTPException(status_code=500, detail=f"TTS 오류: {e}")
 
 
+# ============================
+# 🚀 STT 안정화(가드 + 폴백) 버전
+# ============================
 @api.post("/generate-stt")
 async def generate_stt(file: UploadFile = File(...)):
     try:
         content = await file.read()
+
+        # 1) 빈/짧은 파일 가드 (주로 권한/녹음 실패)
+        if not content or len(content) < 2048:  # 2KB 미만은 사실상 빈 오디오
+            return JSONResponse(
+                {"text": "", "error": f"audio too small: {len(content)} bytes"},
+                status_code=400
+            )
+
         suffix = os.path.splitext(file.filename or "")[-1] or ".webm"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        tmp.write(content); tmp.flush(); tmp.close()
+        try:
+            tmp.write(content)
+            tmp.flush()
+            tmp.close()
 
-        result = openai_client.audio.transcriptions.create(
-            model="gpt-4o-mini-transcribe",
-            file=open(tmp.name, "rb"),
-        )
-        text = getattr(result, "text", "") or ""
-        os.unlink(tmp.name)
-        return JSONResponse({"text": text})
+            # 2) 1차 모델 시도: gpt-4o-mini-transcribe (계정/리전에 따라 미지원일 수 있음)
+            try:
+                with open(tmp.name, "rb") as fh:
+                    result = openai_client.audio.transcriptions.create(
+                        model="gpt-4o-mini-transcribe",
+                        file=fh,
+                    )
+            except Exception:
+                # 3) 2차 폴백: whisper-1
+                with open(tmp.name, "rb") as fh:
+                    result = openai_client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=fh,
+                    )
+
+            text = getattr(result, "text", "") or ""
+            return JSONResponse({"text": text})
+
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
     except Exception as e:
+        # 프런트에서 원인 파악을 쉽게 하려고 메시지 그대로 노출
         return JSONResponse({"text": "", "error": str(e)}, status_code=500)
 
 
